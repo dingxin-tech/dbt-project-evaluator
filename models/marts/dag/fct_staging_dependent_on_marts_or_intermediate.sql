@@ -1,7 +1,13 @@
 -- cases where a staging model depends on a marts/intermediate model
 -- data should flow from raw -> staging -> intermediate -> marts
-with direct_model_relationships as (
-    select  
+select * from (
+    select
+        parent,
+        parent_model_type,
+        child,
+        child_model_type
+    from (
+    select
         *
     from {{ ref('int_all_dag_relationships') }}
     where distance = 1
@@ -9,17 +15,9 @@ with direct_model_relationships as (
     and child_resource_type = 'model'
     and not parent_is_excluded
     and not child_is_excluded
-),
-final as (
-    select
-        parent,
-        parent_model_type,
-        child,
-        child_model_type
-    from direct_model_relationships
+) as direct_model_relationships
     where child_model_type = 'staging'
     and parent_model_type in ('marts', 'intermediate')
-)
-select * from final
-
+) as final
+where 1=1
 {{ filter_exceptions() }}

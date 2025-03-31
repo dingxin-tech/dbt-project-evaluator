@@ -4,6 +4,8 @@ config-version: 2
 
 require-dbt-version: [">=1.8.0", "<2.0.0"]
 
+profile: 'dbt_project_evaluator'
+
 model-paths: ["models"]
 analysis-paths: ["analysis"]
 test-paths: ["tests"]
@@ -86,7 +88,7 @@ vars:
 
   # -- Execution variables --
   insert_batch_size: "{{ 500 if target.type in ['athena', 'bigquery'] else 10000 }}"
-  max_depth_dag: "{{ 9 if target.type in ['bigquery', 'spark', 'databricks'] else 4 if target.type in ['athena', 'trino', 'clickhouse'] else -1 }}"
+  max_depth_dag: "{{ 9 if target.type in ['bigquery', 'spark', 'databricks','maxcompute'] else 4 if target.type in ['athena', 'trino', 'clickhouse'] else -1 }}"
 
   # -- Code complexity variables --
   comment_chars: ["--"]

@@ -84,5 +84,5 @@ different_directories as (
 )
 
 select * from different_directories
-
+where 1=1
 {{ filter_exceptions() }}

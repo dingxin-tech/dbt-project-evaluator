@@ -10,7 +10,7 @@ with sources as (
     where resource_type = 'source'
     and not is_excluded
     -- we order the CTE so that listagg returns values correctly sorted for some warehouses
-    order by 1, 2
+    order by resource_name, source_db_location
 ),
 
 source_duplicates as (
@@ -19,7 +19,7 @@ source_duplicates as (
         {{ dbt.listagg(
             measure = 'resource_name', 
             delimiter_text = "', '", 
-            order_by_clause = 'order by resource_name' if target.type in ['snowflake','redshift','duckdb','trino'])
+            order_by_clause = 'order by resource_name' if target.type in ['snowflake','redshift','duckdb','trino','maxcompute'])
         }} as source_names
     from sources
     group by source_db_location
@@ -27,5 +27,5 @@ source_duplicates as (
 )
 
 select * from source_duplicates
-
+where 1=1
 {{ filter_exceptions() }}

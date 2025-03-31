@@ -1,6 +1,14 @@
 -- this model finds cases where a source is used in multiple direct downstream models
-with direct_source_relationships as (
-    select  
+select * from (
+    select
+        parent,
+        {{ dbt.listagg(
+            measure='child',
+            delimiter_text="', '",
+            order_by_clause='order by child' if target.type in ['snowflake','redshift','duckdb','trino','maxcompute'])
+        }} as model_children
+    from (
+    select
         *
     from {{ ref('int_all_dag_relationships') }}
     where distance = 1
@@ -10,21 +18,9 @@ with direct_source_relationships as (
     and not child_is_excluded
     -- we order the CTE so that listagg returns values correctly sorted for some warehouses
     order by child
-),
-
-source_fanout as (
-    select
-        parent,
-        {{ dbt.listagg(
-            measure='child', 
-            delimiter_text="', '", 
-            order_by_clause='order by child' if target.type in ['snowflake','redshift','duckdb','trino'])
-        }} as model_children
-    from direct_source_relationships
-    group by 1
+) as direct_source_relationships
+    group by parent
     having count(*) > 1
-)
-
-select * from source_fanout
-
+) as source_fanout
+where 1=1
 {{ filter_exceptions() }}

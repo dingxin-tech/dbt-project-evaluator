@@ -20,7 +20,7 @@ appropriate_prefixes as (
         {{ dbt.listagg(
             measure='prefix_value', 
             delimiter_text="', '", 
-            order_by_clause='order by prefix_value' if target.type in ['snowflake','redshift','duckdb','trino'])
+            order_by_clause='order by prefix_value' if target.type in ['snowflake','redshift','duckdb','trino','maxcompute'])
         }} as appropriate_prefixes
     from naming_convention_prefixes
     group by model_type
@@ -53,5 +53,5 @@ inappropriate_model_names as (
 )
 
 select * from inappropriate_model_names
-
+where 1=1
 {{ filter_exceptions() }}

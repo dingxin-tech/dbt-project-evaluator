@@ -22,5 +22,5 @@ inappropriate_subdirectories_sources as (
 )
 
 select * from inappropriate_subdirectories_sources
-
+where 1=1
 {{ filter_exceptions() }}

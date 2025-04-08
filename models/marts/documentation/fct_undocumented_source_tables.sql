@@ -17,5 +17,5 @@ final as (
 )
 
 select * from final
-
+where 1=1
 {{ filter_exceptions() }}

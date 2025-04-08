@@ -35,7 +35,7 @@ count_column_tests as (
         on all_graph_resources.resource_id = relationships.resource_id
     where all_graph_resources.resource_type = 'test'
     and relationships.is_primary_test_relationship
-    group by 1,2
+    group by relationships.direct_parent_id,all_graph_resources.column_name
 ),
 
 count_column_constraints as (
@@ -85,7 +85,7 @@ agg_test_relationships as (
         cast(sum(tests_count) as {{ dbt.type_int()}}) as number_of_tests_on_model,
         cast(sum(constraints_count) as {{ dbt.type_int()}}) as number_of_constraints_on_model
     from combine_column_counts
-    group by 1
+    group by direct_parent_id
 
 ),
 

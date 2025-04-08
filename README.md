@@ -1,3 +1,5 @@
+## Community-maintained fork of the original [dbt-project-evaluator](https://github.com/dbt-labs/dbt-project-evaluator) package with extended support for [dbt-maxcompute](https://github.com/aliyun/dbt-maxcompute) (dbt adapter of Alibaba Cloud MaxCompute).
+
 # dbt_project_evaluator
 
 This package highlights areas of a dbt project that are misaligned with dbt Labs' best practices.
@@ -24,6 +26,7 @@ Currently, the following adapters are supported:
 - AWS Athena (tested manually)
 - Greenplum (tested manually)
 - ClickHouse (tested manually)
+- MaxCompute (tested manually)
 
 ## Using This Package
 

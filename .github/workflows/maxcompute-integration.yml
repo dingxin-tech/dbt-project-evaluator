@@ -1,0 +1,245 @@
+# **what?**
+# Runs the MaxCompute integration suites (integration_tests, integration_tests_minimal,
+# integration_tests_empty) against a live MaxCompute project through the same entrypoint
+# used locally: scripts/run-maxcompute-integration-tests.sh.
+#
+# **why?**
+# MaxCompute support used to be "tested manually". A run therefore could not tell
+# "the rules produced the expected rows" apart from "no SQL ever reached a project".
+# Workflows triggered by a pull request from a fork cannot read repository secrets,
+# so that case has to be reported as NOT RUN instead of as an integration pass.
+#
+# **when?**
+# Push to main, any pull request, or manually. Two repository settings are needed
+# before a real run can happen; see docs/maxcompute-integration-tests.md.
+
+name: MaxCompute Integration Tests
+
+on:
+    push:
+        branches:
+            - main
+    pull_request:
+    workflow_dispatch:
+        inputs:
+            suites:
+                description: "space separated suite dirs (empty = all suites)"
+                required: false
+                type: string
+                default: ""
+
+permissions: read-all
+
+concurrency:
+    group: ${{ github.workflow }}-${{ github.event_name }}-${{ contains(github.event_name, 'pull_request') && github.event.pull_request.head.ref || github.sha }}
+    cancel-in-progress: true
+
+env:
+    PYTHON_VERSION: "3.11"
+    # the version combination this suite was written against; the adapter publishes
+    # to PyPI as dbt-maxcompute, so CI installs the released package instead of a
+    # working copy like the local harness may do
+    DBT_MAXCOMPUTE_VERSION: "1.11.2"
+    DBT_CORE_VERSION: "1.11.2"
+
+jobs:
+    gate-selftest:
+        name: gate self-test (no warehouse needed)
+
+        # Runs before, and independently of, the credential gate: the point of these
+        # checks is that the gate cannot report green for a run that evaluated nothing,
+        # and that has to be visible even when no MaxCompute project is configured.
+        # Nothing here contacts a warehouse, reads a secret, or needs pyodps.
+
+        runs-on: ubuntu-latest
+
+        steps:
+            - name: "Checkout ${{ github.event.repository.name }}"
+              uses: actions/checkout@v4
+
+            - name: "Set up Python ${{ env.PYTHON_VERSION }}"
+              uses: actions/setup-python@v5
+              with:
+                  python-version: ${{ env.PYTHON_VERSION }}
+
+            - name: "Run the gate self-test"
+              run: |
+                  set -o pipefail
+                  mkdir -p "$RUNNER_TEMP/artifacts"
+                  ./scripts/test-mc-integration-gate.sh 2>&1 \
+                      | tee "$RUNNER_TEMP/artifacts/gate-selftest.log"
+                  echo '```' >> "$GITHUB_STEP_SUMMARY"
+                  grep -E "^(  ok|  FAIL|INTEGRATION GATE SELF-TEST|SCHEMA-TEST|status:)" \
+                      "$RUNNER_TEMP/artifacts/gate-selftest.log" >> "$GITHUB_STEP_SUMMARY" || true
+                  echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+    gate:
+        name: gate (are MaxCompute credentials available?)
+
+        runs-on: ubuntu-latest
+
+        outputs:
+            can_run: ${{ steps.decide.outputs.can_run }}
+
+        steps:
+            - name: Decide whether a real run is possible
+              id: decide
+              env:
+                  ACCESS_ID: ${{ secrets.MAXCOMPUTE_ACCESS_ID }}
+                  MC_PROJECT: ${{ vars.MC_PROJECT }}
+                  MC_ENDPOINT: ${{ vars.MC_ENDPOINT }}
+                  IS_FORK_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+                  MUST_PRODUCE_EVIDENCE: ${{ github.event_name != 'pull_request' }}
+              run: |
+                  set -uo pipefail
+                  if [ "$IS_FORK_PR" = "true" ]; then
+                      echo "can_run=false" >> "$GITHUB_OUTPUT"
+                      {
+                          echo ""
+                          echo "## integration: NOT RUN"
+                          echo ""
+                          echo "- This pull request comes from a fork, so the workflow cannot read repository secrets."
+                          echo "- No SQL reached a MaxCompute project. **This is not an integration pass.**"
+                          echo "- A maintainer can run the same suites from this workflow's *Run workflow* page."
+                      } >> "$GITHUB_STEP_SUMMARY"
+                      echo "fork pull request: the integration job is skipped, and says so in the run summary"
+                      exit 0
+                  fi
+
+                  missing=""
+                  for name in ACCESS_ID MC_PROJECT MC_ENDPOINT; do
+                      if [ -z "${!name}" ]; then missing="$missing $name"; fi
+                  done
+                  if [ -n "$missing" ]; then
+                      echo "can_run=false" >> "$GITHUB_OUTPUT"
+                      {
+                          echo ""
+                          echo "## integration: BLOCKED"
+                          echo ""
+                          echo "- Not configured: \`${missing# }\`."
+                          echo "- No SQL reached a MaxCompute project. **This is not an integration pass.**"
+                          echo "- See docs/maxcompute-integration-tests.md for what to configure."
+                      } >> "$GITHUB_STEP_SUMMARY"
+                      if [ "$MUST_PRODUCE_EVIDENCE" = "true" ]; then
+                          echo "::error::integration blocked: ${missing# } is not configured, so no evidence was produced"
+                          exit 1
+                      fi
+                      echo "pull request without a configured project: integration job will be skipped"
+                      exit 0
+                  fi
+
+                  echo "can_run=true" >> "$GITHUB_OUTPUT"
+                  echo "credentials and a project are configured: the integration jobs will contact MaxCompute"
+
+    prepare:
+        name: decide which suites to run
+
+        needs: gate
+
+        if: needs.gate.outputs.can_run == 'true'
+
+        runs-on: ubuntu-latest
+
+        outputs:
+            matrix: ${{ steps.pick.outputs.matrix }}
+
+        steps:
+            - name: "Checkout ${{ github.event.repository.name }}"
+              uses: actions/checkout@v4
+
+            # The selection lives in a script rather than inline here so that every rule
+            # (default set, unknown name, whitespace-only input) can be tested without GitHub.
+            - name: Pick the suites
+              id: pick
+              env:
+                  REQUESTED_SUITES: ${{ inputs.suites }}
+              run: |
+                  set -uo pipefail
+                  # word-split on purpose: the input is documented as space separated.
+                  # An array is used instead of unquoted expansion so that a glob in the
+                  # input cannot match file names.
+                  read -r -a requested <<< "${REQUESTED_SUITES:-}"
+                  out="$(./scripts/ci-select-suites.sh "${requested[@]}")"
+                  rc=$?
+                  if [ $rc -ne 0 ]; then
+                      echo "::error::suite selection failed (rc=$rc): see the log above"
+                      exit $rc
+                  fi
+                  printf '%s\n' "$out" >> "$GITHUB_OUTPUT"
+                  echo "matrix will be: $out"
+
+    integration:
+        name: ${{ matrix.suite }} (live MaxCompute project)
+
+        needs:
+            - gate
+            - prepare
+
+        if: needs.gate.outputs.can_run == 'true'
+
+        runs-on: ubuntu-latest
+
+        # measured on one run of the 155-node suite: ~47 minutes wall, because the
+        # dag rule models are table materializations that each take ~10 minutes
+        # (fct_model_fanout 699.94s, fct_multiple_sources_joined 668.33s)
+        timeout-minutes: 90
+
+        strategy:
+            fail-fast: false
+            matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+
+        env:
+            MC_PROJECT: ${{ vars.MC_PROJECT }}
+            MC_ENDPOINT: ${{ vars.MC_ENDPOINT }}
+            # One schema per (suite, run, attempt). The entrypoint composes these two into
+            # MC_SCHEMA_MC_RUN_ID and owns that schema for the job's lifetime, so both
+            # fields carry a difference that is real: the suite name separates the matrix
+            # jobs inside one run, and run_id + run_attempt separate two runs of the same
+            # suite, including a re-run of the same workflow.
+            #
+            # This used to be `MC_SCHEMA: dpe_ci_${{ github.run_number }}` with no
+            # MC_RUN_ID at all, which left the whole difference between two jobs in the
+            # UTC second the entrypoint appends by default. Two suites starting in the same
+            # second got the same schema and then created and dropped each other's
+            # relations, so a red run could mean "the other job deleted my tables" rather
+            # than anything about the rules under test. `github.run_number` is also shared
+            # by every job of a run, and a re-run keeps it, so it cannot be the token.
+            MC_SCHEMA: dpe_ci_${{ matrix.suite }}
+            MC_RUN_ID: ${{ github.run_id }}a${{ github.run_attempt }}
+            ODPS_ACCESS_ID: ${{ secrets.MAXCOMPUTE_ACCESS_ID }}
+            ODPS_ACCESS_KEY: ${{ secrets.MAXCOMPUTE_ACCESS_KEY }}
+        steps:
+            - name: "Checkout ${{ github.event.repository.name }}"
+              uses: actions/checkout@v4
+
+            - name: "Set up Python ${{ env.PYTHON_VERSION }}"
+              uses: actions/setup-python@v5
+              with:
+                  python-version: ${{ env.PYTHON_VERSION }}
+
+            - name: "Install dbt-core ${{ env.DBT_CORE_VERSION }} + dbt-maxcompute ${{ env.DBT_MAXCOMPUTE_VERSION }}"
+              run: |
+                  python -m pip install --upgrade pip
+                  python -m pip install "dbt-core==${DBT_CORE_VERSION}" "dbt-maxcompute==${DBT_MAXCOMPUTE_VERSION}"
+                  dbt --version
+
+            - name: "Run ${{ matrix.suite }}"
+              run: |
+                  set -o pipefail
+                  mkdir -p "$RUNNER_TEMP/artifacts"
+                  export DPE_ARTIFACT_DIR="$RUNNER_TEMP/artifacts"
+                  ./scripts/run-maxcompute-integration-tests.sh "${{ matrix.suite }}" 2>&1 | tee "$RUNNER_TEMP/${{ matrix.suite }}.log"
+                  echo "" >> "$GITHUB_STEP_SUMMARY"
+                  echo "## ${{ matrix.suite }}" >> "$GITHUB_STEP_SUMMARY"
+                  echo '```' >> "$GITHUB_STEP_SUMMARY"
+                  grep -E "^(PREFLIGHT|SUITE|RUN-SCHEMA|CLEANUP|INTEGRATION|  status|  NOT-PASS)" "$RUNNER_TEMP/${{ matrix.suite }}.log" \
+                      >> "$GITHUB_STEP_SUMMARY" || true
+                  echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+            - name: "Upload dbt run results"
+              if: always()
+              uses: actions/upload-artifact@v4
+              with:
+                  name: ${{ matrix.suite }}-run-results
+                  path: ${{ runner.temp }}/artifacts/
+                  if-no-files-found: warn

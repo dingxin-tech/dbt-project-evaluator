@@ -1,0 +1,443 @@
+#!/usr/bin/env bash
+# **what?**
+# Prove the MaxCompute integration gate fails when there is nothing to believe:
+# an empty result list, an all-skipped suite, a non-zero dbt exit, a missing
+# run_results.json, a requested suite that is not there, a failed `dbt deps`, a run
+# schema that is not one safe identifier, relation-bearing nodes that report executed
+# while the schema the run owns stays empty, a run schema that cannot be read at all, and
+# a suite whose previous run_results.json could not be deleted. Also prove the shapes that
+# must stay usable: a clean suite is green - including its artifact snapshot when the stale
+# file *is* removed - a tests-only suite is green with a schema that is really empty (read
+# back from the fake server's state, not from the wording), and two matrix jobs running in
+# parallel own different schemas. Reads the workflow file
+# to check the schema names a real matrix would compose.
+#
+# **why?**
+# The point of the entrypoint is to tell "the rules produced the expected rows" apart
+# from "no SQL ever ran". A gate that returns 0 for zero rows cannot do that, and the
+# only way to know a gate still has teeth is to run it against every false-green shape it
+# is meant to catch. Nothing here needs a warehouse, credentials, pyodps or network, so
+# it also holds on a fork pull request, where no real run is possible at all.
+#
+# **when?**
+# By the `gate-selftest` job of .github/workflows/maxcompute-integration.yml (runs on
+# every pull request), and locally:
+#
+#   ./scripts/test-mc-integration-gate.sh                       # this working tree
+#   ./scripts/test-mc-integration-gate.sh /path/to/scripts /path/to/workflow   # A/B
+#
+# Exit codes: 0 every expectation held | 1 at least one did not | 2 missing test input.
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+UNDER="${1:-$REPO_ROOT/scripts}"
+WORKFLOW="${2:-$REPO_ROOT/.github/workflows/maxcompute-integration.yml}"
+REAL_SUPPORT="$UNDER/mc_integration_support.py"
+GATE_SCRIPT="$UNDER/run-maxcompute-integration-tests.sh"
+FIXTURES="$REPO_ROOT/tests/gate/fixtures.sh"
+FAKE_ODPS="$REPO_ROOT/tests/gate/fake_odps.py"
+SCHEMA_TEST="$REPO_ROOT/tests/gate/schema_uniqueness.py"
+MATRIX_CONTRACT="$REPO_ROOT/tests/gate/matrix_contract.py"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+
+for required in "$REAL_SUPPORT" "$GATE_SCRIPT" "$FIXTURES" "$FAKE_ODPS" "$SCHEMA_TEST" "$MATRIX_CONTRACT" "$WORKFLOW"; do
+    [ -f "$required" ] || { echo "SETUP: FAIL missing $required"; exit 2; } done
+
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+# Same warehouse double, but reachable without building a whole repo: a pre-fix copy of
+# the support script imported pyodps at module scope, and without this shim an A/B run
+# would "fail" for a missing dependency rather than for the gate logic being tested.
+SHIM="$WORK/shim"
+mkdir -p "$SHIM"
+cp "$FAKE_ODPS" "$SHIM/odps.py"
+CHECKS=0
+FAILURES=0
+
+ok()  { CHECKS=$((CHECKS + 1)); printf '  ok    %s\n' "$1"; }
+bad() { CHECKS=$((CHECKS + 1)); FAILURES=$((FAILURES + 1)); printf '  FAIL  %s\n' "$1"; }
+show() { printf '%s\n' "$2" | tail -16 | sed 's/^/        | /'; }
+
+# shellcheck source=/dev/null
+. "$FIXTURES"
+
+echo "== gate self-test"
+echo "   scripts  : $UNDER"
+echo "   workflow : $WORKFLOW"
+echo ""
+
+# ---------------------------------------------------------------- summary() verdicts
+summary_case() {
+    local name="$1" expected="$2" needle="$3" json="$4" file rc out
+    file="$WORK/$name.json"
+    printf '%s\n' "$json" > "$file"
+    out="$(PYTHONPATH="$SHIM" "$PYTHON_BIN" "$REAL_SUPPORT" summary "$file" "$name" 2>&1)"; rc=$?
+    if [ "$rc" -ne "$expected" ]; then
+        bad "summary/$name exited $rc, expected $expected"; show "$name" "$out"
+    elif [ -n "$needle" ] && ! grep -qF -- "$needle" <<<"$out"; then
+        bad "summary/$name exited $rc but never says '$needle'"; show "$name" "$out"
+    else
+        ok "summary/$name exited $rc and says '$needle'"
+    fi
+}
+
+echo "-- summary(): one case per false-green shape"
+summary_case empty_results  1 "no node produced a result"    "$(fixture_empty)"
+summary_case all_skipped    1 "every node was skipped/no-op" "$(fixture_all_skipped)"
+summary_case one_fail       1 "NOT-PASS"                     "$(fixture_one_fail)"
+summary_case unknown_status 1 "NOT-PASS"                     "$(fixture_unknown_status)"
+summary_case clean_pass     0 "MATERIALIZING=1"              "$(fixture_clean_pass)"
+summary_case real_live_shape 0 "GATE=PASS"                   "$(fixture_real_live_shape)"
+# The other side of the same new branch: a suite whose nodes all ran but none of them is
+# a model/seed/snapshot, so it must be counted as 0 - otherwise the run-schema check
+# would demand relations from a tests-only suite and false-alarm.
+summary_case tests_only     0 "MATERIALIZING=0"              "$(fixture_tests_only)"
+
+# ----------------------------------------------------- the entrypoint as a whole
+# A repo-shaped temp directory, so the entrypoint resolves its suites exactly as in CI.
+# `dbt` is a script that obeys the mode handed to it; the warehouse SDK is doubled by
+# tests/gate/fake_odps.py, which is on PYTHONPATH as `odps`. The preflight and cleanup
+# code paths under test are the real ones - only the server is fake.
+build_repo() {
+    local repo="$1" suite
+    mkdir -p "$repo/scripts" "$repo/bin" "$repo/results" "$repo/shim"
+    cp "$GATE_SCRIPT" "$REAL_SUPPORT" "$repo/scripts/"
+    cp "$FAKE_ODPS" "$repo/shim/odps.py"
+    for suite in fake_suite second_suite; do
+        mkdir -p "$repo/$suite" "$repo/$suite/target"
+        printf 'name: %s\nversion: "1.0.0"\n' "$suite" > "$repo/$suite/dbt_project.yml"
+        # Every suite dir starts with a previous invocation's results file in place, the way a
+        # real working tree does. A gate that reads target/run_results.json without first
+        # clearing it will credit this decoy, and the no_results_file case goes green on
+        # evidence from a run that never happened.
+        printf '%s\n' "$(fixture_clean_pass)" > "$repo/$suite/target/run_results.json"
+    done
+    cat > "$repo/bin/dbt" <<'FAKE_DBT'
+#!/usr/bin/env python3
+"""dbt stand-in: answers the two subcommands the entrypoint calls, nothing else."""
+import os
+import shutil
+import sys
+
+sub = sys.argv[1] if len(sys.argv) > 1 else ""
+mode = os.environ.get("GATE_MODE", "clean_pass")
+
+if sub == "deps":
+    print("fake dbt deps: mode=%s" % mode)
+    sys.exit(1 if mode == "deps_fails" else 0)
+
+if sub == "build":
+    target = sys.argv[sys.argv.index("--target") + 1] if "--target" in sys.argv else "?"
+    print("fake dbt build: mode=%s target=%s" % (mode, target))
+
+    # What real dbt does with the profile it is handed: create relations in *that* schema.
+    # Reading the schema out of the generated profiles.yml is the only way this harness can
+    # tell "the run landed in the schema it owns" apart from "the results file says so",
+    # which is precisely the difference the entrypoint now checks.
+    schema = ""
+    profile_path = os.path.join(os.environ.get("DBT_PROFILES_DIR", ""), "profiles.yml")
+    if os.path.exists(profile_path):
+        with open(profile_path) as handle:
+            for line in handle:
+                if line.strip().startswith("schema:"):
+                    schema = line.split(":", 1)[1].strip()
+    if schema and os.environ.get("FAKE_ODPS_STATE"):
+        import odps
+        client = odps.ODPS(access_id="stub-id", secret_access_key="stub-key")
+        if mode == "executed_no_relations":
+            pass  # the false-green shape: results claim models ran, schema stays empty
+        elif mode == "tests_only":
+            # A tests-only run executes test nodes, and test nodes create no relation. The
+            # fixture used to seed gate_model here anyway, so the case that claims "nothing
+            # was expected to materialise" was reading a schema holding one relation - the
+            # assertion could not fail (review finding 2 on 24566c8, 2026-11-10).
+            pass
+        elif mode == "schema_vanished":
+            client.delete_schema(schema)  # nothing to read back later -> unreadable path
+        else:
+            odps.seed_relation(os.environ["FAKE_ODPS_STATE"], schema, "gate_model")
+    if mode != "no_results_file":
+        os.makedirs("target", exist_ok=True)
+        source = os.path.join(os.environ["GATE_RESULTS_DIR"], mode + ".json")
+        if os.path.exists(source):
+            shutil.copyfile(source, "target/run_results.json")
+        else:
+            open("target/run_results.json", "w").write('{"results": []}')
+    sys.exit(int(os.environ.get("GATE_DBT_RC", "0")))
+
+print("fake dbt: unexpected call %r" % (sys.argv[1:],))
+sys.exit(0)
+FAKE_DBT
+    cat > "$repo/bin/rm" <<'FAKE_RM'
+#!/bin/sh
+# Fault injection used by the stale-unremovable case below: with FAKE_REMOVE_FAILS=1 it
+# refuses to delete a path ending in target/run_results.json and lets every other rm through
+# to the real one. Production code is not touched - this only exists on the PATH of a test
+# invocation, which is how the reviewer reproduced the finding.
+last=""
+for a in "$@"; do last="$a"; done
+if [ "${FAKE_REMOVE_FAILS:-0}" = "1" ]; then
+    case "$last" in
+        */target/run_results.json)
+            printf 'rm: cannot remove %s: Permission denied\n' "$last" >&2
+            exit 1 ;;
+    esac
+fi
+exec /bin/rm "$@"
+FAKE_RM
+    chmod +x "$repo/bin/dbt" "$repo/bin/rm"
+    local pair
+    for pair in empty_results all_skipped one_fail clean_pass real_live_shape build_failed no_results_file deps_fails executed_no_relations schema_vanished tests_only; do
+        case "$pair" in
+            empty_results) printf '%s\n' "$(fixture_empty)"        > "$repo/results/$pair.json" ;;
+            all_skipped)   printf '%s\n' "$(fixture_all_skipped)"  > "$repo/results/$pair.json" ;;
+            one_fail)      printf '%s\n' "$(fixture_one_fail)"     > "$repo/results/$pair.json" ;;
+            tests_only)    printf '%s\n' "$(fixture_tests_only)"   > "$repo/results/$pair.json" ;;
+            *)             printf '%s\n' "$(fixture_clean_pass)"   > "$repo/results/$pair.json" ;;
+        esac
+    done
+}
+
+# gate_run <repo> <log file> <mode> <suites...> -- extra env as NAME=value before the call
+gate_run() {
+    local repo="$1" log="$2" mode="$3"; shift 3
+    env PATH="$repo/bin:$PATH" \
+        PYTHONPATH="$repo/shim" \
+        PYTHON_BIN="$PYTHON_BIN" \
+        FAKE_ODPS_STATE="$repo/fake-odps-state.json" \
+        MC_PROJECT=stub-project MC_ENDPOINT=http://stub-endpoint \
+        ODPS_ACCESS_ID=stub-id ODPS_ACCESS_KEY=stub-key \
+        MC_SCHEMA=dpe_ci MC_RUN_ID="$mode" \
+        GATE_MODE="$mode" GATE_RESULTS_DIR="$repo/results" GATE_DBT_RC=0 \
+        DPE_DEPS_ATTEMPTS=1 \
+        "$repo/scripts/run-maxcompute-integration-tests.sh" "$@" > "$log" 2>&1
+}
+
+gate_case() {
+    local name="$1" mode="$2" expected="$3" needle="$4" suites="$5"; shift 5
+    local repo="$WORK/repo-$name" log="$WORK/$name.log" rc out
+    build_repo "$repo"
+    out="$(env PATH="$repo/bin:$PATH" PYTHONPATH="$repo/shim" PYTHON_BIN="$PYTHON_BIN" \
+            FAKE_ODPS_STATE="$repo/fake-odps-state.json" \
+            MC_PROJECT=stub-project MC_ENDPOINT=http://stub-endpoint \
+            ODPS_ACCESS_ID=stub-id ODPS_ACCESS_KEY=stub-key \
+            MC_SCHEMA=dpe_ci MC_RUN_ID="$mode" \
+            GATE_MODE="$mode" GATE_RESULTS_DIR="$repo/results" GATE_DBT_RC=0 \
+            DPE_DEPS_ATTEMPTS=1 "$@" \
+            "$repo/scripts/run-maxcompute-integration-tests.sh" $suites 2>&1)"; rc=$?
+    printf '%s\n' "$out" > "$log"
+    if [ "$rc" -ne "$expected" ]; then
+        bad "gate/$name exited $rc, expected $expected"; show "$name" "$out"
+    elif [ -n "$needle" ] && ! grep -qF -- "$needle" <<<"$out"; then
+        bad "gate/$name exited $rc but never says '$needle'"; show "$name" "$out"
+    else
+        ok "gate/$name exited $rc and says '$needle'"
+    fi
+}
+
+echo ""
+echo "-- run-maxcompute-integration-tests.sh: one case per false-green shape"
+gate_case clean_pass      clean_pass      0 "GATE=PASS"                          fake_suite
+gate_case real_live_shape real_live_shape 0 "GATE=PASS"                          fake_suite
+gate_case empty_results   empty_results   1 "no node produced a result"           fake_suite
+gate_case all_skipped     all_skipped     1 "every node was skipped/no-op"        fake_suite
+gate_case build_failed    build_failed    1 "BUILD-FAILED"                        fake_suite GATE_DBT_RC=1
+gate_case no_results_file no_results_file 1 "NOT-RUN (dbt wrote no run_results.json)" fake_suite
+gate_case deps_fails      deps_fails      1 "NOT-RUN (packages could not be installed)" fake_suite
+gate_case missing_suite   clean_pass      1 "NOT-PRESENT"                         nope_suite
+gate_case unsafe_schema   clean_pass      2 "not a plain identifier"              fake_suite MC_RUN_ID="1234-5678"
+# The schema this run owns must contain something once relation-bearing nodes report
+# executed. Results alone cannot show it: dropping an empty schema is trivially green.
+gate_case empty_run_schema executed_no_relations 1 "RUN-SCHEMA: EMPTY"             fake_suite
+# ...and the check must not fire when nothing was expected to materialise.
+gate_case tests_only_green tests_only      0 "RUN-SCHEMA: SKIPPED"                 fake_suite
+# A schema that cannot be read is its own failure, not a silent "empty".
+gate_case schema_vanished  schema_vanished 1 "RUN-SCHEMA: UNREADABLE"              fake_suite
+
+# ------------------------------------------- stale results that cannot be deleted
+# Review finding on 24566c8 (2026-11-10): the entrypoint used to print COULD-NOT-REMOVE and
+# carry on, so a suite whose previous run_results.json could not be deleted was still built,
+# still summarised (against that stale file) and still snapshotted - and with dbt exiting 0
+# without writing anything, the whole invocation reported GATE=PASS / status: PASSED / rc 0.
+# Deleting is now a precondition for believing the file, so this case asserts both halves:
+# the run fails closed, and the schema it owns is still cleaned up.
+echo ""
+echo "-- stale run_results.json that cannot be deleted: fail closed, still clean up"
+rem_repo="$WORK/repo-stale-unremovable"; rem_log="$WORK/stale-unremovable.log"
+build_repo "$rem_repo"
+mkdir -p "$rem_repo/artifacts"
+rem_out="$(env PATH="$rem_repo/bin:$PATH" PYTHONPATH="$rem_repo/shim" PYTHON_BIN="$PYTHON_BIN" \
+        FAKE_ODPS_STATE="$rem_repo/fake-odps-state.json" \
+        MC_PROJECT=stub-project MC_ENDPOINT=http://stub-endpoint \
+        ODPS_ACCESS_ID=stub-id ODPS_ACCESS_KEY=stub-key \
+        MC_SCHEMA=dpe_ci MC_RUN_ID=stale_unremovable \
+        GATE_MODE=no_results_file GATE_RESULTS_DIR="$rem_repo/results" GATE_DBT_RC=0 \
+        DPE_DEPS_ATTEMPTS=1 FAKE_REMOVE_FAILS=1 DPE_ARTIFACT_DIR="$rem_repo/artifacts" \
+        "$rem_repo/scripts/run-maxcompute-integration-tests.sh" fake_suite 2>&1)"; rem_rc=$?
+printf '%s\n' "$rem_out" > "$rem_log"
+if [ $rem_rc -eq 0 ]; then
+    bad "gate/stale_unremovable exited 0: a suite whose previous results could not be deleted must not be a pass"
+else
+    ok "gate/stale_unremovable exits $rem_rc (nonzero)"
+fi
+if grep -qF 'STALE-UNREMOVABLE' <<<"$rem_out"; then
+    ok "gate/stale_unremovable names the failure (STALE-UNREMOVABLE)"
+else
+    bad "gate/stale_unremovable failed without saying which rule fired"; show "stale-unremovable" "$rem_out"
+fi
+if grep -qF 'GATE=PASS' <<<"$rem_out"; then
+    bad "gate/stale_unremovable still printed GATE=PASS off another invocation's file"
+else
+    ok "gate/stale_unremovable prints no GATE=PASS for that suite"
+fi
+if grep -qF 'build: rc=' <<<"$rem_out"; then
+    bad "gate/stale_unremovable built anyway after the removal failed"
+else
+    ok "gate/stale_unremovable skips the build for that suite"
+fi
+if [ -n "$(ls -A "$rem_repo/artifacts" 2>/dev/null)" ]; then
+    bad "gate/stale_unremovable copied the stale file into the artifact dir: $(ls "$rem_repo/artifacts")"
+else
+    ok "gate/stale_unremovable copies nothing into the artifact dir"
+fi
+if grep -qF 'CLEANUP: OK dropped 1 schema(s)' <<<"$rem_out"; then
+    ok "gate/stale_unremovable still drops the schema this run owns (failing closed does not leak)"
+else
+    bad "gate/stale_unremovable did not clean up the owned schema"; show "stale-unremovable" "$rem_out"
+fi
+# ...and the controls the reviewer asked to keep: when deletion succeeds, or when there was
+# nothing stale to delete, the suite still builds, still summarises, still snapshots.
+ctrl_repo="$WORK/repo-stale-removed"; ctrl_log="$WORK/stale-removed.log"
+build_repo "$ctrl_repo"
+mkdir -p "$ctrl_repo/artifacts"
+ctrl_out="$(env PATH="$ctrl_repo/bin:$PATH" PYTHONPATH="$ctrl_repo/shim" PYTHON_BIN="$PYTHON_BIN" \
+        FAKE_ODPS_STATE="$ctrl_repo/fake-odps-state.json" \
+        MC_PROJECT=stub-project MC_ENDPOINT=http://stub-endpoint \
+        ODPS_ACCESS_ID=stub-id ODPS_ACCESS_KEY=stub-key \
+        MC_SCHEMA=dpe_ci MC_RUN_ID=stale_removed \
+        GATE_MODE=clean_pass GATE_RESULTS_DIR="$ctrl_repo/results" GATE_DBT_RC=0 \
+        DPE_DEPS_ATTEMPTS=1 DPE_ARTIFACT_DIR="$ctrl_repo/artifacts" \
+        "$ctrl_repo/scripts/run-maxcompute-integration-tests.sh" fake_suite 2>&1)"; ctrl_rc=$?
+printf '%s\n' "$ctrl_out" > "$ctrl_log"
+if [ $ctrl_rc -eq 0 ] && grep -qF 'removed before building' <<<"$ctrl_out" && grep -qF 'GATE=PASS' <<<"$ctrl_out"; then
+    ok "gate/stale_removed control still passes when the delete succeeds (rc=$ctrl_rc)"
+else
+    bad "gate/stale_removed control: the fix must not break the normal path (rc=$ctrl_rc)"; show "stale-removed" "$ctrl_out"
+fi
+if [ -f "$ctrl_repo/artifacts/fake_suite-run_results.json" ]; then
+    ok "gate/stale_removed control still snapshots this run's own results"
+else
+    bad "gate/stale_removed control lost its artifact copy"
+fi
+
+# -------------------------------------- the tests-only fixture must really be empty
+# The wording-only assertion was the gap: it checked exit 0 and `RUN-SCHEMA: SKIPPED`
+# while the fake warehouse still held a relation inside the schema this run owned. Read the
+# state itself, with schemas retained, so the fixture cannot claim emptiness it did not create.
+echo ""
+echo "-- tests-only: assert the owned schema is actually empty, not just worded as skipped"
+tso_repo="$WORK/repo-tests-only-state"; tso_log="$WORK/tests-only-state.log"
+build_repo "$tso_repo"
+tso_out="$(env PATH="$tso_repo/bin:$PATH" PYTHONPATH="$tso_repo/shim" PYTHON_BIN="$PYTHON_BIN" \
+        FAKE_ODPS_STATE="$tso_repo/fake-odps-state.json" \
+        MC_PROJECT=stub-project MC_ENDPOINT=http://stub-endpoint \
+        ODPS_ACCESS_ID=stub-id ODPS_ACCESS_KEY=stub-key \
+        MC_SCHEMA=dpe_ci MC_RUN_ID=tests_only \
+        GATE_MODE=tests_only GATE_RESULTS_DIR="$tso_repo/results" GATE_DBT_RC=0 \
+        DPE_DEPS_ATTEMPTS=1 MC_KEEP_SCHEMAS=1 \
+        "$tso_repo/scripts/run-maxcompute-integration-tests.sh" fake_suite 2>&1)"; tso_rc=$?
+printf '%s\n' "$tso_out" > "$tso_log"
+if [ $tso_rc -eq 0 ] && grep -qF 'MATERIALIZING=0' <<<"$tso_out" && grep -qF 'RUN-SCHEMA: SKIPPED' <<<"$tso_out"; then
+    ok "gate/tests_only_state exits 0 with MATERIALIZING=0 and RUN-SCHEMA: SKIPPED"
+else
+    bad "gate/tests_only_state: expected exit 0 + MATERIALIZING=0 + RUN-SCHEMA: SKIPPED (rc=$tso_rc)"; show "tests-only-state" "$tso_out"
+fi
+tso_state="$("$PYTHON_BIN" - "$tso_repo/fake-odps-state.json" <<'STATE_PY'
+import json, sys
+data = json.load(open(sys.argv[1]))
+schemas = data.get("schemas", {})
+name = "dpe_ci_tests_only"
+if name not in schemas:
+    print("MISSING-SCHEMA")
+else:
+    print("RELATIONS=%d:%s" % (len(schemas[name]), ",".join(schemas[name])))
+STATE_PY
+)"
+if [ "$tso_state" = "RELATIONS=0:" ]; then
+    ok "gate/tests_only_state: the schema this run owns really holds 0 relations ($tso_state)"
+else
+    bad "gate/tests_only_state: expected the owned schema to exist and be empty, got '$tso_state' - a fixture that seeds a relation cannot assert emptiness"
+fi
+
+# ------------------------------------------------- schemas a run creates and drops
+# The ownership rule is what keeps a suite from deleting somebody else's warehouse, so
+# it is asserted from the fake server's state, not from the log's wording.
+echo ""
+echo "-- schema ownership"
+iso_repo="$WORK/repo-schema-ownership"; iso_log="$WORK/schema-ownership.log"
+build_repo "$iso_repo"
+gate_run "$iso_repo" "$iso_log" clean_pass fake_suite; iso_rc=$?
+if [ $iso_rc -ne 0 ]; then
+    bad "gate/schema-ownership run exited $iso_rc, expected 0"; show "schema-ownership" "$(cat "$iso_log")"
+else
+    got="$("$PYTHON_BIN" - "$iso_repo/fake-odps-state.json" <<'PY'
+import json,sys
+state=json.load(open(sys.argv[1]))
+print("leftover=%d" % len(state["schemas"]))
+PY
+)"
+    if [ "$got" != "leftover=0" ]; then
+        bad "the run left its schema behind ($got) - cleanup is supposed to drop what it created"
+    elif ! grep -qF "CLEANUP: OK dropped 1 schema(s) owned by this run: dpe_ci_clean_pass" "$iso_log"; then
+        bad "cleanup did not report dropping exactly this run's schema"; show "schema-ownership" "$(cat "$iso_log")"
+    else
+        ok "run created exactly its own schema (dpe_ci_clean_pass) and dropped it again"
+    fi
+fi
+
+# A pre-existing schema must not be touched: that is another run's data.
+pre_repo="$WORK/repo-preexisting"; pre_log="$WORK/preexisting.log"
+build_repo "$pre_repo"
+FAKE_ODPS_DIR="$(cd "$(dirname "$FAKE_ODPS")" && pwd)"     "$PYTHON_BIN" - "$pre_repo/fake-odps-state.json" <<'PY'
+import os, sys
+sys.path.insert(0, os.environ["FAKE_ODPS_DIR"])
+import fake_odps
+fake_odps.seed_relation(sys.argv[1], "dpe_ci_clean_pass", "somebody_elses_table")
+PY
+gate_run "$pre_repo" "$pre_log" clean_pass fake_suite
+if grep -qE "CLEANUP: (OK dropped|FAIL)" "$pre_log" && grep -q "dropped schema dpe_ci_clean_pass" "$pre_log"; then
+    bad "the run dropped a schema it did not create"; show "preexisting" "$(cat "$pre_log")"
+elif ! grep -qF "CLEANUP: OK nothing to drop" "$pre_log"; then
+    bad "cleanup did not report leaving the pre-existing schema alone"; show "preexisting" "$(cat "$pre_log")"
+else
+    ok "a schema that already existed was left alone, including the relation inside it"
+fi
+
+# ------------------------------------------- the schemas a CI matrix would compose
+echo ""
+echo "-- schema isolation across the matrix"
+"$PYTHON_BIN" "$SCHEMA_TEST" "$WORKFLOW"
+schema_rc=$?
+if [ $schema_rc -eq 0 ]; then ok "schema_uniqueness: every matrix job composes its own schema"; else bad "schema_uniqueness exited $schema_rc"; fi
+
+# ------------------------------------------------ the matrix producer/consumer contract
+# 2026-11-05 review: the selector emitted a bare JSON array while `strategy.matrix` needs an
+# object, so the whole workflow would have been rejected the moment the credential gate let the
+# live job run. Selector-only tests could not see that - only pairing the two ends can.
+"$PYTHON_BIN" "$MATRIX_CONTRACT"
+mc_rc=$?
+if [ $mc_rc -eq 0 ]; then ok "matrix contract: selector payload is the shape strategy.matrix accepts (default + explicit)"; else bad "matrix contract exited $mc_rc (2 = 什么都没判，别当通过)"; fi
+"$PYTHON_BIN" "$MATRIX_CONTRACT" --selftest
+mcs_rc=$?
+if [ $mcs_rc -eq 0 ]; then ok "matrix contract self-test: 四条配对 + 真 producer + 剥壳还原旧形状全部命中预期"; else bad "matrix contract self-test exited $mcs_rc"; fi
+
+# 计数口径自证：ok()/bad() 是唯一自增点。曾有 5 处手工 CHECKS+=1 叠在 ok/bad 之外，
+# 于是公布出去的 checks 比真实断言条数多 5（10-25 起我引用的 25/29 都含这层虚高）。
+stray=$(grep -n 'CHECKS=\$((CHECKS + 1))' "$0" | grep -vE '^[0-9]+:(ok|bad)\(\)' | wc -l)
+if [ "$stray" -eq 0 ]; then ok "counter hygiene: ok()/bad() 是唯一计数点（手工自增残留 0 处）"; else bad "counter hygiene: 发现 $stray 处手工 CHECKS 自增，公布数会虚高"; fi
+
+echo ""
+echo "INTEGRATION GATE SELF-TEST: checks=$CHECKS failures=$FAILURES"
+[ "$FAILURES" -eq 0 ] || { echo "status: FAILED (the gate does not hold)"; exit 1; }
+echo "status: PASSED (every false-green shape is caught; the clean run is still green)"

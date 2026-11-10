@@ -167,10 +167,22 @@ for suite in "${SUITES[@]}"; do
     # executed` off a file whose own metadata said the invocation started 11 days earlier.
     # Removing that one generated file (nothing else in target/) is what makes "no results were
     # written" reportable as NOT-RUN instead of as somebody else's green run.
+    # A stale file this run could not delete is not "a run that produced no evidence" - it is
+    # evidence from somebody else's earlier run, and everything below would then print
+    # GATE=PASS for work that never happened. Review finding on 24566c8 (2026-11-10): with
+    # deletion made to fail and dbt exiting 0 without writing results, the decoy was copied
+    # into the artifact directory and the invocation exited 0 with `status: PASSED`.
+    # So removal failure ends this suite: no build, no summary, no snapshot. It does not end
+    # the invocation, and it cannot leak - the owned-schema cleanup at the bottom of this
+    # script is outside the loop and keyed off what *this* run created.
     if [ -f "$project_dir/target/run_results.json" ]; then
-        rm -f "$project_dir/target/run_results.json" \
-            && echo "SUITE $suite: stale run_results.json from a previous invocation removed before building" \
-            || echo "SUITE $suite: COULD-NOT-REMOVE stale run_results.json - results below may not belong to this run"
+        if rm -f "$project_dir/target/run_results.json"; then
+            echo "SUITE $suite: stale run_results.json from a previous invocation removed before building"
+        else
+            echo "SUITE $suite: STALE-UNREMOVABLE target/run_results.json could not be deleted - counted as a failure, and this suite is not built, summarised or snapshotted (any results would belong to another run)"
+            OVERALL=1
+            continue
+        fi
     fi
     # `dbt deps` clones git packages over TLS and that transport flakes - or is
     # blocked outright - on shared runners and dev boxes, so it is retried before

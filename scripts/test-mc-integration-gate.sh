@@ -4,10 +4,12 @@
 # an empty result list, an all-skipped suite, a non-zero dbt exit, a missing
 # run_results.json, a requested suite that is not there, a failed `dbt deps`, a run
 # schema that is not one safe identifier, relation-bearing nodes that report executed
-# while the schema the run owns stays empty, and a run schema that cannot be read at
-# all. Also prove the three shapes that must stay usable: a clean suite is green, a
-# tests-only suite is green with an empty schema (nothing was expected to materialise),
-# and two matrix jobs running in parallel own different schemas. Reads the workflow file
+# while the schema the run owns stays empty, a run schema that cannot be read at all, and
+# a suite whose previous run_results.json could not be deleted. Also prove the shapes that
+# must stay usable: a clean suite is green - including its artifact snapshot when the stale
+# file *is* removed - a tests-only suite is green with a schema that is really empty (read
+# back from the fake server's state, not from the wording), and two matrix jobs running in
+# parallel own different schemas. Reads the workflow file
 # to check the schema names a real matrix would compose.
 #
 # **why?**
@@ -145,6 +147,12 @@ if sub == "build":
         client = odps.ODPS(access_id="stub-id", secret_access_key="stub-key")
         if mode == "executed_no_relations":
             pass  # the false-green shape: results claim models ran, schema stays empty
+        elif mode == "tests_only":
+            # A tests-only run executes test nodes, and test nodes create no relation. The
+            # fixture used to seed gate_model here anyway, so the case that claims "nothing
+            # was expected to materialise" was reading a schema holding one relation - the
+            # assertion could not fail (review finding 2 on 24566c8, 2026-11-10).
+            pass
         elif mode == "schema_vanished":
             client.delete_schema(schema)  # nothing to read back later -> unreadable path
         else:
@@ -161,7 +169,24 @@ if sub == "build":
 print("fake dbt: unexpected call %r" % (sys.argv[1:],))
 sys.exit(0)
 FAKE_DBT
-    chmod +x "$repo/bin/dbt"
+    cat > "$repo/bin/rm" <<'FAKE_RM'
+#!/bin/sh
+# Fault injection used by the stale-unremovable case below: with FAKE_REMOVE_FAILS=1 it
+# refuses to delete a path ending in target/run_results.json and lets every other rm through
+# to the real one. Production code is not touched - this only exists on the PATH of a test
+# invocation, which is how the reviewer reproduced the finding.
+last=""
+for a in "$@"; do last="$a"; done
+if [ "${FAKE_REMOVE_FAILS:-0}" = "1" ]; then
+    case "$last" in
+        */target/run_results.json)
+            printf 'rm: cannot remove %s: Permission denied\n' "$last" >&2
+            exit 1 ;;
+    esac
+fi
+exec /bin/rm "$@"
+FAKE_RM
+    chmod +x "$repo/bin/dbt" "$repo/bin/rm"
     local pair
     for pair in empty_results all_skipped one_fail clean_pass real_live_shape build_failed no_results_file deps_fails executed_no_relations schema_vanished tests_only; do
         case "$pair" in
@@ -229,6 +254,121 @@ gate_case empty_run_schema executed_no_relations 1 "RUN-SCHEMA: EMPTY"          
 gate_case tests_only_green tests_only      0 "RUN-SCHEMA: SKIPPED"                 fake_suite
 # A schema that cannot be read is its own failure, not a silent "empty".
 gate_case schema_vanished  schema_vanished 1 "RUN-SCHEMA: UNREADABLE"              fake_suite
+
+# ------------------------------------------- stale results that cannot be deleted
+# Review finding on 24566c8 (2026-11-10): the entrypoint used to print COULD-NOT-REMOVE and
+# carry on, so a suite whose previous run_results.json could not be deleted was still built,
+# still summarised (against that stale file) and still snapshotted - and with dbt exiting 0
+# without writing anything, the whole invocation reported GATE=PASS / status: PASSED / rc 0.
+# Deleting is now a precondition for believing the file, so this case asserts both halves:
+# the run fails closed, and the schema it owns is still cleaned up.
+echo ""
+echo "-- stale run_results.json that cannot be deleted: fail closed, still clean up"
+rem_repo="$WORK/repo-stale-unremovable"; rem_log="$WORK/stale-unremovable.log"
+build_repo "$rem_repo"
+mkdir -p "$rem_repo/artifacts"
+rem_out="$(env PATH="$rem_repo/bin:$PATH" PYTHONPATH="$rem_repo/shim" PYTHON_BIN="$PYTHON_BIN" \
+        FAKE_ODPS_STATE="$rem_repo/fake-odps-state.json" \
+        MC_PROJECT=stub-project MC_ENDPOINT=http://stub-endpoint \
+        ODPS_ACCESS_ID=stub-id ODPS_ACCESS_KEY=stub-key \
+        MC_SCHEMA=dpe_ci MC_RUN_ID=stale_unremovable \
+        GATE_MODE=no_results_file GATE_RESULTS_DIR="$rem_repo/results" GATE_DBT_RC=0 \
+        DPE_DEPS_ATTEMPTS=1 FAKE_REMOVE_FAILS=1 DPE_ARTIFACT_DIR="$rem_repo/artifacts" \
+        "$rem_repo/scripts/run-maxcompute-integration-tests.sh" fake_suite 2>&1)"; rem_rc=$?
+printf '%s\n' "$rem_out" > "$rem_log"
+if [ $rem_rc -eq 0 ]; then
+    bad "gate/stale_unremovable exited 0: a suite whose previous results could not be deleted must not be a pass"
+else
+    ok "gate/stale_unremovable exits $rem_rc (nonzero)"
+fi
+if grep -qF 'STALE-UNREMOVABLE' <<<"$rem_out"; then
+    ok "gate/stale_unremovable names the failure (STALE-UNREMOVABLE)"
+else
+    bad "gate/stale_unremovable failed without saying which rule fired"; show "stale-unremovable" "$rem_out"
+fi
+if grep -qF 'GATE=PASS' <<<"$rem_out"; then
+    bad "gate/stale_unremovable still printed GATE=PASS off another invocation's file"
+else
+    ok "gate/stale_unremovable prints no GATE=PASS for that suite"
+fi
+if grep -qF 'build: rc=' <<<"$rem_out"; then
+    bad "gate/stale_unremovable built anyway after the removal failed"
+else
+    ok "gate/stale_unremovable skips the build for that suite"
+fi
+if [ -n "$(ls -A "$rem_repo/artifacts" 2>/dev/null)" ]; then
+    bad "gate/stale_unremovable copied the stale file into the artifact dir: $(ls "$rem_repo/artifacts")"
+else
+    ok "gate/stale_unremovable copies nothing into the artifact dir"
+fi
+if grep -qF 'CLEANUP: OK dropped 1 schema(s)' <<<"$rem_out"; then
+    ok "gate/stale_unremovable still drops the schema this run owns (failing closed does not leak)"
+else
+    bad "gate/stale_unremovable did not clean up the owned schema"; show "stale-unremovable" "$rem_out"
+fi
+# ...and the controls the reviewer asked to keep: when deletion succeeds, or when there was
+# nothing stale to delete, the suite still builds, still summarises, still snapshots.
+ctrl_repo="$WORK/repo-stale-removed"; ctrl_log="$WORK/stale-removed.log"
+build_repo "$ctrl_repo"
+mkdir -p "$ctrl_repo/artifacts"
+ctrl_out="$(env PATH="$ctrl_repo/bin:$PATH" PYTHONPATH="$ctrl_repo/shim" PYTHON_BIN="$PYTHON_BIN" \
+        FAKE_ODPS_STATE="$ctrl_repo/fake-odps-state.json" \
+        MC_PROJECT=stub-project MC_ENDPOINT=http://stub-endpoint \
+        ODPS_ACCESS_ID=stub-id ODPS_ACCESS_KEY=stub-key \
+        MC_SCHEMA=dpe_ci MC_RUN_ID=stale_removed \
+        GATE_MODE=clean_pass GATE_RESULTS_DIR="$ctrl_repo/results" GATE_DBT_RC=0 \
+        DPE_DEPS_ATTEMPTS=1 DPE_ARTIFACT_DIR="$ctrl_repo/artifacts" \
+        "$ctrl_repo/scripts/run-maxcompute-integration-tests.sh" fake_suite 2>&1)"; ctrl_rc=$?
+printf '%s\n' "$ctrl_out" > "$ctrl_log"
+if [ $ctrl_rc -eq 0 ] && grep -qF 'removed before building' <<<"$ctrl_out" && grep -qF 'GATE=PASS' <<<"$ctrl_out"; then
+    ok "gate/stale_removed control still passes when the delete succeeds (rc=$ctrl_rc)"
+else
+    bad "gate/stale_removed control: the fix must not break the normal path (rc=$ctrl_rc)"; show "stale-removed" "$ctrl_out"
+fi
+if [ -f "$ctrl_repo/artifacts/fake_suite-run_results.json" ]; then
+    ok "gate/stale_removed control still snapshots this run's own results"
+else
+    bad "gate/stale_removed control lost its artifact copy"
+fi
+
+# -------------------------------------- the tests-only fixture must really be empty
+# The wording-only assertion was the gap: it checked exit 0 and `RUN-SCHEMA: SKIPPED`
+# while the fake warehouse still held a relation inside the schema this run owned. Read the
+# state itself, with schemas retained, so the fixture cannot claim emptiness it did not create.
+echo ""
+echo "-- tests-only: assert the owned schema is actually empty, not just worded as skipped"
+tso_repo="$WORK/repo-tests-only-state"; tso_log="$WORK/tests-only-state.log"
+build_repo "$tso_repo"
+tso_out="$(env PATH="$tso_repo/bin:$PATH" PYTHONPATH="$tso_repo/shim" PYTHON_BIN="$PYTHON_BIN" \
+        FAKE_ODPS_STATE="$tso_repo/fake-odps-state.json" \
+        MC_PROJECT=stub-project MC_ENDPOINT=http://stub-endpoint \
+        ODPS_ACCESS_ID=stub-id ODPS_ACCESS_KEY=stub-key \
+        MC_SCHEMA=dpe_ci MC_RUN_ID=tests_only \
+        GATE_MODE=tests_only GATE_RESULTS_DIR="$tso_repo/results" GATE_DBT_RC=0 \
+        DPE_DEPS_ATTEMPTS=1 MC_KEEP_SCHEMAS=1 \
+        "$tso_repo/scripts/run-maxcompute-integration-tests.sh" fake_suite 2>&1)"; tso_rc=$?
+printf '%s\n' "$tso_out" > "$tso_log"
+if [ $tso_rc -eq 0 ] && grep -qF 'MATERIALIZING=0' <<<"$tso_out" && grep -qF 'RUN-SCHEMA: SKIPPED' <<<"$tso_out"; then
+    ok "gate/tests_only_state exits 0 with MATERIALIZING=0 and RUN-SCHEMA: SKIPPED"
+else
+    bad "gate/tests_only_state: expected exit 0 + MATERIALIZING=0 + RUN-SCHEMA: SKIPPED (rc=$tso_rc)"; show "tests-only-state" "$tso_out"
+fi
+tso_state="$("$PYTHON_BIN" - "$tso_repo/fake-odps-state.json" <<'STATE_PY'
+import json, sys
+data = json.load(open(sys.argv[1]))
+schemas = data.get("schemas", {})
+name = "dpe_ci_tests_only"
+if name not in schemas:
+    print("MISSING-SCHEMA")
+else:
+    print("RELATIONS=%d:%s" % (len(schemas[name]), ",".join(schemas[name])))
+STATE_PY
+)"
+if [ "$tso_state" = "RELATIONS=0:" ]; then
+    ok "gate/tests_only_state: the schema this run owns really holds 0 relations ($tso_state)"
+else
+    bad "gate/tests_only_state: expected the owned schema to exist and be empty, got '$tso_state' - a fixture that seeds a relation cannot assert emptiness"
+fi
 
 # ------------------------------------------------- schemas a run creates and drops
 # The ownership rule is what keeps a suite from deleting somebody else's warehouse, so

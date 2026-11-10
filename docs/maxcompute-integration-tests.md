@@ -72,6 +72,7 @@ So these are **failures**, each of them used to be a pass:
 | `MC_SCHEMA_MC_RUN_ID` is not one plain identifier, or is longer than 64 characters | `INTEGRATION: BLOCKED` | a name with a separator is the same name on a server that folds identifiers, so two suites would share a schema |
 | `dbt` was interrupted or timed out and wrote no results, so the only file in `target/` is a previous invocation's | `SUITE <name>: NOT-RUN (dbt wrote no run_results.json)`, preceded by `SUITE <name>: stale run_results.json from a previous invocation removed before building` | a stale file describes somebody else's run. Crediting it prints `GATE=PASS` for work that never happened - measured on a build killed by the timeout, whose results file still carried an invocation 11 days older |
 | model/seed/snapshot nodes report executed while the run's own schema holds 0 relations | `RUN-SCHEMA: EMPTY ... (not a pass)` | results only prove dbt *reported* success. If the relations landed in some other schema - a resolved-schema regression, a `database`/`schema` override in the fixtures - the isolation above is defeated and cleanup still says OK, because dropping an empty schema is trivially green |
+| the previous invocation's `target/run_results.json` exists but **cannot be deleted** (read-only directory, a file held open by another user, an immutable flag) | `SUITE <name>: STALE-UNREMOVABLE ... counted as a failure`, and that suite is not built, summarised or snapshotted | believing a file you could not clear is the same false green as crediting a run that never wrote one: the entrypoint used to print `COULD-NOT-REMOVE` and carry on, so the decoy was copied into the artifact directory and the invocation exited 0 with `status: PASSED` (reproduced by fault injection in the offline self-test - see the `gate/stale_unremovable` case). The schema this run owns is still dropped: failing closed must not leak warehouse objects |
 | the run's own schema is gone or cannot be read at that moment | `RUN-SCHEMA: MISSING` + `RUN-SCHEMA: UNREADABLE (rc=...)` | a failed read must not be reported as the very finding this check looks for, nor defaulted to "empty": it is its own failure |
 
 The line each suite prints carries the counts, so a green run is auditable rather than
@@ -215,5 +216,12 @@ installs the pinned combination above.
 - The profile is generated at run time (temp dir, `auth_type: chain`) so nothing about the
   warehouse or its credentials is committed; `env_var()` in `profiles.yml` does still work on
   dbt-core 1.11.2, measured - so this is a design choice, not a workaround.
+- A self-test assertion is only worth what the fixture behind it does. The `tests_only` case used
+  to check `exit 0` + `RUN-SCHEMA: SKIPPED` while the fake warehouse was still seeding a relation
+  into the schema under test, so the wording was true and the state was not. The fake now seeds
+  nothing for `tests_only` (test nodes create no relation) and the case reads the fake server's
+  state back: the owned schema must exist and hold 0 relations. If you change a fixture, check
+  that the assertion can still fail - the copy in which the old seeding is restored reports
+  `RELATIONS=1:gate_model` and goes red.
 - The exceptions seed is matched with `not like`, and `_` is a single-character wildcard in
   `LIKE`. Fixture names that rely on exemptions are therefore distinct enough not to collide.
